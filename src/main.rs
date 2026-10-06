@@ -58,7 +58,11 @@ impl Type {
     }
 
     fn con_with_args(name: &str, args: Vec<TypePtr>) -> TypePtr {
-        Type::Con(TypeCon { name: name.into(), args }).into()
+        Type::Con(TypeCon {
+            name: name.into(),
+            args,
+        })
+        .into()
     }
 
     fn variant(name: &str, payload: TypePtr) -> TypePtr {
@@ -81,10 +85,9 @@ impl Type {
                 con.args.iter().map(|a| a.borrow().find(env)).collect(),
             ),
             Type::Variant(tag, payload) => Type::variant(tag, payload.borrow().find(env)),
-            Type::Scheme(scheme) => Type::scheme(
-                scheme.for_all.clone(),
-                scheme.ty.borrow().find(env),
-            ),
+            Type::Scheme(scheme) => {
+                Type::scheme(scheme.for_all.clone(), scheme.ty.borrow().find(env))
+            }
         }
     }
 }
@@ -118,16 +121,10 @@ fn generalize(ty: &TypePtr) -> Type {
     }
 }
 
-#[derive(Debug, Clone)]
-enum Constraint {
-    Equals(TypePtr, TypePtr),
-}
-
 #[derive(Debug, Default, Clone)]
 struct TypeEnv {
     variables: HashMap<Id, TypePtr>,
     substitutions: HashMap<String, TypePtr>,
-    constraints: Vec<Constraint>,
 }
 
 impl TypeEnv {
@@ -150,10 +147,6 @@ impl TypeEnv {
     fn fresh(&self) -> TypePtr {
         let id = NEXT_TYPE_VAR.fetch_add(1, Ordering::Relaxed);
         Type::var(&format!("t{id}"))
-    }
-
-    fn equal(&mut self, a: TypePtr, b: TypePtr) {
-        self.constraints.push(Constraint::Equals(a, b));
     }
 }
 
@@ -192,14 +185,18 @@ impl Node<'_> {
                 self.r#type.borrow_mut().replace(t.clone());
                 return t;
             }
-            let t = self.r#type.borrow_mut()
+            let t = self
+                .r#type
+                .borrow_mut()
                 .get_or_insert_with(|| Type::var(self.lexem))
                 .clone();
             env.insert(self.lexem.into(), t.clone());
             return t;
         }
 
-        let t = self.r#type.borrow_mut()
+        let t = self
+            .r#type
+            .borrow_mut()
             .get_or_insert_with(|| env.fresh())
             .clone();
         // Retain the prototype's convention for a named function definition.
@@ -215,7 +212,7 @@ impl Node<'_> {
 
     fn set_type_equals(&self, ty: TypePtr, env: &mut TypeEnv) {
         let own = self.get_type(env);
-        env.equal(own, ty);
+        unify(own, ty, env);
     }
 }
 
@@ -239,9 +236,13 @@ fn unify(left: TypePtr, right: TypePtr, env: &mut TypeEnv) {
     let rt = right.borrow().clone();
 
     match (lt, rt) {
-        (Type::Var(a), Type::Var(b)) if a.name == b.name => {},
+        (Type::Var(a), Type::Var(b)) if a.name == b.name => {}
         (Type::Var(a), _) => {
-            assert!(!occurs_in(&a.name, &right, env), "occurs check failed for {}", a.name);
+            assert!(
+                !occurs_in(&a.name, &right, env),
+                "occurs check failed for {}",
+                a.name
+            );
             env.substitute(&a, right);
         }
         (_, Type::Var(_)) => unify(right, left, env),
@@ -271,7 +272,7 @@ fn unify(left: TypePtr, right: TypePtr, env: &mut TypeEnv) {
 ///   A(p)    : selected = A(beta); recursively check p against beta
 fn bind_pattern(pattern: &Node<'_>, selected: TypePtr, env: &mut TypeEnv) {
     match pattern.kind {
-        Kind::PatternWildcard => {},
+        Kind::PatternWildcard => {}
         Kind::PatternBind => {
             pattern.r#type.borrow_mut().replace(selected.clone());
             env.insert(pattern.lexem.into(), selected);
@@ -282,7 +283,7 @@ fn bind_pattern(pattern: &Node<'_>, selected: TypePtr, env: &mut TypeEnv) {
             };
             let payload = env.fresh();
             let expected = Type::variant(pattern.lexem, payload.clone());
-            env.equal(selected, expected);
+            unify(selected, expected, env);
             bind_pattern(payload_pattern, payload, env);
         }
         _ => panic!("unsupported pattern: {:?}", pattern.kind),
@@ -290,7 +291,7 @@ fn bind_pattern(pattern: &Node<'_>, selected: TypePtr, env: &mut TypeEnv) {
 }
 
 fn inferno<'a>(ast: &'a Node<'a>, env: TypeEnv) -> TypeEnv {
-    solve(inferno_rec(ast, env))
+    inferno_rec(ast, env)
 }
 
 fn inferno_rec<'a>(ast: &'a Node<'a>, mut env: TypeEnv) -> TypeEnv {
@@ -307,7 +308,7 @@ fn inferno_rec<'a>(ast: &'a Node<'a>, mut env: TypeEnv) -> TypeEnv {
             env = inferno_rec(right, env);
             let lt = left.get_type(&mut env);
             let rt = right.get_type(&mut env);
-            env.equal(lt, rt);
+            unify(lt, rt, &mut env);
             ast.set_type_equals(Type::con("()"), &mut env);
         }
         Kind::Function => {
@@ -332,7 +333,11 @@ fn inferno_rec<'a>(ast: &'a Node<'a>, mut env: TypeEnv) -> TypeEnv {
             let function_ty = function.get_type(&mut env);
             let argument_ty = argument.get_type(&mut env);
             let result_ty = env.fresh();
-            env.equal(function_ty, Type::con_with_args("->", vec![argument_ty, result_ty.clone()]));
+            unify(
+                function_ty,
+                Type::con_with_args("->", vec![argument_ty, result_ty.clone()]),
+                &mut env,
+            );
             ast.r#type.borrow_mut().replace(result_ty);
         }
         Kind::Variant => {
@@ -341,7 +346,9 @@ fn inferno_rec<'a>(ast: &'a Node<'a>, mut env: TypeEnv) -> TypeEnv {
             };
             env = inferno_rec(argument, env);
             let payload_ty = argument.get_type(&mut env);
-            ast.r#type.borrow_mut().replace(Type::variant(ast.lexem, payload_ty));
+            ast.r#type
+                .borrow_mut()
+                .replace(Type::variant(ast.lexem, payload_ty));
         }
         Kind::Match => {
             let [scrutinee, arms @ ..] = &ast.children[..] else {
@@ -362,21 +369,13 @@ fn inferno_rec<'a>(ast: &'a Node<'a>, mut env: TypeEnv) -> TypeEnv {
                 bind_pattern(pattern, selected.clone(), &mut env);
                 env = inferno_rec(body, env);
                 let body_ty = body.get_type(&mut env);
-                env.equal(match_result.clone(), body_ty);
+                unify(match_result.clone(), body_ty, &mut env);
                 env.variables = outer_variables;
             }
 
             ast.r#type.borrow_mut().replace(match_result);
         }
         _ => panic!("unexpected node in expression position: {:?}", ast.kind),
-    }
-    env
-}
-
-fn solve(mut env: TypeEnv) -> TypeEnv {
-    for constraint in std::mem::take(&mut env.constraints) {
-        let Constraint::Equals(a, b) = constraint;
-        unify(a, b, &mut env);
     }
     env
 }
@@ -392,12 +391,25 @@ fn main() {
 
 // Tiny test / example AST builders (not part of the algorithm).
 fn node<'a>(lexem: &'a str, kind: Kind, children: Vec<Node<'a>>) -> Node<'a> {
-    Node { lexem, kind, children, r#type: Default::default() }
+    Node {
+        lexem,
+        kind,
+        children,
+        r#type: Default::default(),
+    }
 }
-fn var(name: &str) -> Node<'_> { node(name, Kind::Var, vec![]) }
-fn num() -> Node<'static> { node("42", Kind::Num, vec![]) }
-fn bind(name: &str) -> Node<'_> { node(name, Kind::PatternBind, vec![]) }
-fn wildcard() -> Node<'static> { node("_", Kind::PatternWildcard, vec![]) }
+fn var(name: &str) -> Node<'_> {
+    node(name, Kind::Var, vec![])
+}
+fn num() -> Node<'static> {
+    node("42", Kind::Num, vec![])
+}
+fn bind(name: &str) -> Node<'_> {
+    node(name, Kind::PatternBind, vec![])
+}
+fn wildcard() -> Node<'static> {
+    node("_", Kind::PatternWildcard, vec![])
+}
 fn tag<'a>(name: &'a str, payload: Node<'a>) -> Node<'a> {
     node(name, Kind::PatternTag, vec![payload])
 }
@@ -435,12 +447,14 @@ mod tests {
             }
             other => panic!("expected x = A(beta), got {other:?}"),
         }
-        assert!(env.constraints.is_empty());
     }
 
     #[test]
     fn known_variant_extracts_payload() {
-        let ast = match_node(variant("A", num()), vec![arm(tag("A", bind("v")), var("v"))]);
+        let ast = match_node(
+            variant("A", num()),
+            vec![arm(tag("A", bind("v")), var("v"))],
+        );
         let mut env = inferno(&ast, TypeEnv::default());
         assert_u32(&ast.find(&mut env));
     }
@@ -455,38 +469,38 @@ mod tests {
         assert_u32(&ast.find(&mut env));
     }
 
-	#[test]
-	fn paper_example_2_classical_limitation() {
-	    let ast = match_node(
-	        var("x"),
-	        vec![
-	            arm(
-	                tag("A", wildcard()),
-	                variant("B", num()),
-	            ),
-	            arm(
-	                bind("y"),
-	                var("y"),
-	            ),
-	        ],
-	    );
-	
-	    let _ = inferno(&ast, TypeEnv::default());
-	}
+    #[test]
+    fn paper_example_2_classical_limitation() {
+        let ast = match_node(
+            var("x"),
+            vec![
+                arm(tag("A", wildcard()), variant("B", num())),
+                arm(bind("y"), var("y")),
+            ],
+        );
+
+        let _ = inferno(&ast, TypeEnv::default());
+    }
 
     #[test]
     fn wildcard_does_not_restrict_scrutinee() {
         let ast = match_node(var("x"), vec![arm(wildcard(), num())]);
         let mut env = inferno(&ast, TypeEnv::default());
         assert_u32(&ast.find(&mut env));
-        assert!(matches!(&*ast.children[0].find(&mut env).borrow(), Type::Var(_)));
+        assert!(matches!(
+            &*ast.children[0].find(&mut env).borrow(),
+            Type::Var(_)
+        ));
     }
 
     #[test]
     fn variable_pattern_aliases_scrutinee() {
         let ast = match_node(var("x"), vec![arm(bind("v"), var("v"))]);
         let mut env = inferno(&ast, TypeEnv::default());
-        assert_eq!(*ast.find(&mut env).borrow(), *ast.children[0].find(&mut env).borrow());
+        assert_eq!(
+            *ast.find(&mut env).borrow(),
+            *ast.children[0].find(&mut env).borrow()
+        );
         assert!(env.get("v").is_none(), "pattern binding leaked out of arm");
     }
 
@@ -494,10 +508,7 @@ mod tests {
     fn two_bodies_unify_to_one_result_type() {
         let ast = match_node(
             variant("A", num()),
-            vec![
-                arm(tag("A", bind("v")), var("v")),
-                arm(wildcard(), num()),
-            ],
+            vec![arm(tag("A", bind("v")), var("v")), arm(wildcard(), num())],
         );
         let mut env = inferno(&ast, TypeEnv::default());
         assert_u32(&ast.find(&mut env));
@@ -506,7 +517,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "different variant tags")]
     fn different_tag_is_not_structurally_unifiable() {
-        let ast = match_node(variant("B", num()), vec![arm(tag("A", bind("v")), var("v"))]);
+        let ast = match_node(
+            variant("B", num()),
+            vec![arm(tag("A", bind("v")), var("v"))],
+        );
         let _ = inferno(&ast, TypeEnv::default());
     }
 
@@ -536,4 +550,3 @@ mod tests {
         assert_u32(&apply.find(&mut env));
     }
 }
-
